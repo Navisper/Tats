@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Anime Explorer</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 0; background: #0f172a; color: #e2e8f0; }
+    header { background: #1e293b; padding: 16px 24px; }
+    h1 { margin: 0; font-size: 20px; }
+    main { max-width: 900px; margin: 24px auto; padding: 0 16px; }
+    .card { background: #111827; border: 1px solid #374151; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    label { display: block; font-size: 12px; color: #9ca3af; margin-bottom: 6px; }
+    input { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #374151; background: #0b1220; color: #e2e8f0; }
+    button { padding: 10px 16px; border: 0; border-radius: 10px; background: #3b82f6; color: white; font-weight: 600; cursor: pointer; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px; border-bottom: 1px solid #374151; }
+    th { text-align: left; color: #a3a3a3; font-weight: 600; }
+    .actions { display: flex; gap: 8px; }
+    .muted { color: #94a3b8; font-size: 12px; }
+    .row { display: grid; grid-template-columns: 2fr 1fr 1fr auto; gap: 12px; align-items: center; }
+    .footer { text-align: center; color: #64748b; padding: 24px 0 40px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Anime Explorer — Frontend</h1>
+  </header>
+  <main>
+    <div class="card">
+      <h3>Agregar Anime</h3>
+      <div class="grid">
+        <div>
+          <label>Título</label>
+          <input id="title" placeholder="Ej: Fullmetal Alchemist"/>
+        </div>
+        <div>
+          <label>Género</label>
+          <input id="genre" placeholder="Acción, Aventura"/>
+        </div>
+        <div>
+          <label>Episodios</label>
+          <input id="episodes" type="number" placeholder="64"/>
+        </div>
+        <div style="display:flex; align-items:flex-end;">
+          <button id="addBtn">Guardar</button>
+        </div>
+      </div>
+      <p class="muted" id="status"></p>
+    </div>
+
+    <div class="card">
+      <h3>Listado</h3>
+      <div id="list"></div>
+    </div>
+
+    <div class="footer">Hecho con FastAPI + Postgres + Nginx</div>
+  </main>
+
+<script>
+const API_BASE = (location.hostname === "localhost" || location.hostname === "127.0.0.1")
+  ? "http://localhost:8000"
+  : `http://${location.hostname}:8000`;
+
+const list = document.getElementById("list");
+const statusEl = document.getElementById("status");
+
+function el(tag, attrs={}, children=[]) {
+  const e = document.createElement(tag);
+  Object.entries(attrs).forEach(([k,v]) => e.setAttribute(k, v));
+  children.forEach(c => e.appendChild(typeof c === "string" ? document.createTextNode(c) : c));
+  return e;
+}
+
+async function fetchAnimes() {
+  list.innerHTML = "<p class='muted'>Cargando...</p>";
+  try {
+    const res = await fetch(API_BASE + "/animes");
+    const data = await res.json();
+    renderList(data);
+  } catch (e) {
+    list.innerHTML = "<p class='muted'>Error cargando lista.</p>";
+  }
+}
+
+function renderList(items) {
+  const container = el("div");
+  items.forEach(a => {
+    const row = el("div", { class: "row"} , [
+      el("div", {}, [el("strong", {}, [a.title])]),
+      el("div", {}, [a.genre || "—"]),
+      el("div", {}, [String(a.episodes ?? "—")]),
+      actionButtons(a.id)
+    ]);
+    container.appendChild(row);
+  });
+  list.innerHTML = "";
+  list.appendChild(container);
+}
+
+function actionButtons(id) {
+  const container = el("div", { class: "actions" }, []);
+  const del = el("button", {}, ["Eliminar"]);
+  del.onclick = async () => {
+    if (!confirm("¿Eliminar?")) return;
+    await fetch(API_BASE + "/animes/" + id, { method:"DELETE" });
+    fetchAnimes();
+  };
+  return el("div", {}, [container.appendChild(del), container]);
+}
+
+document.getElementById("addBtn").onclick = async () => {
+  const title = document.getElementById("title").value.trim();
+  const genre = document.getElementById("genre").value.trim();
+  const episodes = parseInt(document.getElementById("episodes").value || "0", 10) || null;
+  if (!title) { alert("Título es requerido"); return; }
+  statusEl.textContent = "Guardando...";
+  try {
+    await fetch(API_BASE + "/animes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, genre: genre || null, episodes })
+    });
+    document.getElementById("title").value = "";
+    document.getElementById("genre").value = "";
+    document.getElementById("episodes").value = "";
+    statusEl.textContent = "Guardado ✓";
+    fetchAnimes();
+  } catch (e) {
+    statusEl.textContent = "Error al guardar";
+  }
+};
+
+fetchAnimes();
+</script>
+</body>
+</html>
