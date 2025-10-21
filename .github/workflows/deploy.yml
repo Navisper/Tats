@@ -1,0 +1,1037 @@
+name: Deploy to Railway
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      frontend-image: ${{ steps.load-images.outputs.frontend-image }}
+      backend-image: ${{ steps.load-images.outputs.backend-image }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set environment based on branch
+        id: set-env
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          else
+            echo "environment=staging" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+      
+      - name: Build frontend Docker image
+        id: build-frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          platforms: linux/amd64
+          tags: frontend:${{ github.sha }}
+          load: true
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+          outputs: type=docker,dest=/tmp/frontend-image.tar
+      
+      - name: Build backend Docker image
+        id: build-backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          platforms: linux/amd64
+          tags: backend:${{ github.sha }}
+          load: true
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+          outputs: type=docker,dest=/tmp/backend-image.tar
+      
+      - name: Load Docker images
+        id: load-images
+        run: |
+          docker load -i /tmp/frontend-image.tar
+          docker load -i /tmp/backend-image.tar
+          echo "frontend-image=frontend:${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "backend-image=backend:${{ github.sha }}" >> $GITHUB_OUTPUT
+      
+      - name: Validate Docker images
+        run: |
+          echo "=== Docker Image Validation ==="
+          
+          echo "Validating frontend image structure..."
+          docker run --rm frontend:${{ github.sha }} nginx -t
+          docker run --rm frontend:${{ github.sha }} ls -la /usr/share/nginx/html
+          
+          echo "Validating backend image structure..."
+          docker run --rm backend:${{ github.sha }} python -c "import sys; print(f'Python {sys.version} validation passed')"
+          docker run --rm backend:${{ github.sha }} python -c "import fastapi; print('FastAPI import successful')"
+          docker run --rm backend:${{ github.sha }} python -c "import uvicorn; print('Uvicorn import successful')"
+      
+      - name: Test frontend static file serving
+        run: |
+          echo "=== Frontend Static File Serving Test ==="
+          
+          # Start frontend container in background
+          docker run -d --name frontend-test -p 8080:80 frontend:${{ github.sha }}
+          
+          # Wait for container to be ready
+          sleep 5
+          
+          # Test static file serving
+          echo "Testing frontend accessibility..."
+          curl -f http://localhost:8080/ || (echo "Frontend static file serving failed" && exit 1)
+          
+          # Check if HTML content is served
+          response=$(curl -s http://localhost:8080/)
+          if [[ "$response" == *"html"* ]] || [[ "$response" == *"HTML"* ]]; then
+            echo "✓ Frontend serves HTML content successfully"
+          else
+            echo "✗ Frontend does not serve expected HTML content"
+            echo "Response: $response"
+            exit 1
+          fi
+          
+          # Cleanup
+          docker stop frontend-test
+          docker rm frontend-test
+      
+      - name: Test backend API health check
+        run: |
+          echo "=== Backend API Health Check Test ==="
+          
+          # Start backend container in background with test database URL
+          docker run -d --name backend-test -p 8000:8000 \
+            -e DATABASE_URL="sqlite:///./test.db" \
+            -e ENVIRONMENT="test" \
+            backend:${{ github.sha }}
+          
+          # Wait for container to be ready
+          sleep 10
+          
+          # Test basic API accessibility
+          echo "Testing backend API accessibility..."
+          max_attempts=30
+          attempt=1
+          
+          while [ $attempt -le $max_attempts ]; do
+            if curl -f http://localhost:8000/docs > /dev/null 2>&1; then
+              echo "✓ Backend API is accessible"
+              break
+            fi
+            
+            if [ $attempt -eq $max_attempts ]; then
+              echo "✗ Backend API failed to start after $max_attempts attempts"
+              docker logs backend-test
+              exit 1
+            fi
+            
+            echo "Attempt $attempt/$max_attempts: Waiting for backend to start..."
+            sleep 2
+            ((attempt++))
+          done
+          
+          # Test health endpoint if it exists
+          if curl -f http://localhost:8000/health > /dev/null 2>&1; then
+            health_response=$(curl -s http://localhost:8000/health)
+            echo "✓ Health endpoint accessible: $health_response"
+          else
+            echo "ℹ Health endpoint not available (will be implemented in later tasks)"
+          fi
+          
+          # Test API documentation endpoint
+          docs_response=$(curl -s http://localhost:8000/docs)
+          if [[ "$docs_response" == *"swagger"* ]] || [[ "$docs_response" == *"FastAPI"* ]]; then
+            echo "✓ API documentation is accessible"
+          else
+            echo "✗ API documentation not accessible"
+            exit 1
+          fi
+          
+          # Cleanup
+          docker stop backend-test
+          docker rm backend-test
+
+  deploy-to-railway:
+    name: Deploy to Railway
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    environment: ${{ needs.build-and-test.outputs.environment }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Update commit status - Deployment starting
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'pending',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Deploying to Railway...',
+              context: 'railway-deployment/deploy'
+            });
+      
+      - name: Install Railway CLI
+        run: |
+          echo "Installing Railway CLI..."
+          curl -fsSL https://railway.app/install.sh | sh
+          echo "$HOME/.railway/bin" >> $GITHUB_PATH
+          
+          # Verify installation
+          railway --version || {
+            echo "❌ Railway CLI installation failed"
+            exit 1
+          }
+          echo "✅ Railway CLI installed successfully"
+      
+      - name: Authenticate with Railway
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          echo "Authenticating with Railway..."
+          
+          # Validate Railway token exists
+          if [[ -z "$RAILWAY_TOKEN" ]]; then
+            echo "❌ RAILWAY_TOKEN secret is not configured"
+            echo "Please add RAILWAY_TOKEN to GitHub repository secrets"
+            exit 1
+          fi
+          
+          # Authenticate with Railway
+          railway login --token "$RAILWAY_TOKEN" || {
+            echo "❌ Railway authentication failed"
+            echo "Please verify RAILWAY_TOKEN is valid and has proper permissions"
+            exit 1
+          }
+          
+          # Verify authentication
+          railway whoami || {
+            echo "❌ Railway authentication verification failed"
+            exit 1
+          }
+          
+          echo "✅ Railway authentication successful"
+      
+      - name: Set Railway project based on environment
+        id: railway-config
+        run: |
+          environment="${{ needs.build-and-test.outputs.environment }}"
+          echo "Setting up Railway project for environment: $environment"
+          
+          # Determine project ID based on environment
+          if [[ "$environment" == "production" ]]; then
+            project_id="${{ secrets.RAILWAY_PROJECT_ID_PROD }}"
+            echo "Using production project configuration"
+          else
+            project_id="${{ secrets.RAILWAY_PROJECT_ID_STAGING }}"
+            echo "Using staging project configuration"
+          fi
+          
+          # Validate project ID exists
+          if [[ -z "$project_id" ]]; then
+            echo "❌ Railway project ID not configured for environment: $environment"
+            if [[ "$environment" == "production" ]]; then
+              echo "Please add RAILWAY_PROJECT_ID_PROD to GitHub repository secrets"
+            else
+              echo "Please add RAILWAY_PROJECT_ID_STAGING to GitHub repository secrets"
+            fi
+            exit 1
+          fi
+          
+          echo "project-id=$project_id" >> $GITHUB_OUTPUT
+          echo "environment=$environment" >> $GITHUB_OUTPUT
+          
+          # Verify project access
+          railway link "$project_id" || {
+            echo "❌ Failed to link to Railway project: $project_id"
+            echo "Please verify the project ID is correct and accessible"
+            exit 1
+          }
+          
+          # List services to verify project access
+          echo "Verifying project access..."
+          railway status || {
+            echo "❌ Failed to access Railway project services"
+            exit 1
+          }
+          
+          echo "✅ Railway project configured successfully"
+          echo "Project ID: $project_id"
+          echo "Environment: $environment"
+      
+      - name: Deploy Database Service
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          echo "🗄️ Deploying database service..."
+          
+          ENVIRONMENT="${{ steps.railway-config.outputs.environment }}"
+          SERVICE_NAME="anime-database-${ENVIRONMENT}"
+          
+          # Check if database service exists
+          if railway service list | grep -q "$SERVICE_NAME"; then
+            echo "Database service '$SERVICE_NAME' already exists"
+            railway service use "$SERVICE_NAME"
+          else
+            echo "Creating new database service: $SERVICE_NAME"
+            railway service create "$SERVICE_NAME" --type postgresql || {
+              echo "❌ Failed to create database service"
+              exit 1
+            }
+            railway service use "$SERVICE_NAME"
+          fi
+          
+          # Configure database service
+          echo "Configuring database service..."
+          
+          # Set database environment variables
+          railway variables set POSTGRES_DB="anime_db" || {
+            echo "❌ Failed to set POSTGRES_DB variable"
+            exit 1
+          }
+          
+          railway variables set POSTGRES_USER="anime_user" || {
+            echo "❌ Failed to set POSTGRES_USER variable"
+            exit 1
+          }
+          
+          # Wait for database to be ready
+          echo "Waiting for database service to be ready..."
+          sleep 30
+          
+          # Get database connection URL for other services
+          DATABASE_URL=$(railway variables get DATABASE_URL 2>/dev/null || echo "")
+          if [[ -z "$DATABASE_URL" ]]; then
+            echo "⚠️ DATABASE_URL not yet available, will be set by Railway automatically"
+          else
+            echo "✅ Database service configured with connection URL"
+          fi
+          
+          echo "✅ Database service deployment completed"
+      
+      - name: Deploy Backend Service
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          echo "🔧 Deploying backend service..."
+          
+          ENVIRONMENT="${{ steps.railway-config.outputs.environment }}"
+          SERVICE_NAME="anime-backend-${ENVIRONMENT}"
+          COMMIT_SHA="${{ github.sha }}"
+          
+          # Check if backend service exists
+          if railway service list | grep -q "$SERVICE_NAME"; then
+            echo "Backend service '$SERVICE_NAME' already exists"
+            railway service use "$SERVICE_NAME"
+          else
+            echo "Creating new backend service: $SERVICE_NAME"
+            railway service create "$SERVICE_NAME" || {
+              echo "❌ Failed to create backend service"
+              exit 1
+            }
+            railway service use "$SERVICE_NAME"
+          fi
+          
+          # Configure backend service environment variables
+          echo "Configuring backend service environment variables..."
+          
+          railway variables set ENVIRONMENT="$ENVIRONMENT" || {
+            echo "❌ Failed to set ENVIRONMENT variable"
+            exit 1
+          }
+          
+          railway variables set COMMIT_SHA="$COMMIT_SHA" || {
+            echo "❌ Failed to set COMMIT_SHA variable"
+            exit 1
+          }
+          
+          # Set CORS configuration based on environment
+          if [[ "$ENVIRONMENT" == "production" ]]; then
+            CORS_ORIGINS="https://anime-frontend-production.railway.app"
+            CORS_METHODS="GET,POST,PUT,DELETE,OPTIONS"
+            CORS_HEADERS="Content-Type,Authorization,X-Requested-With"
+            CORS_MAX_AGE="86400"
+            CORS_ADDITIONAL_ORIGINS=""
+          else
+            CORS_ORIGINS="https://anime-frontend-staging.railway.app"
+            CORS_METHODS="GET,POST,PUT,DELETE,OPTIONS,PATCH"
+            CORS_HEADERS="Content-Type,Authorization,X-Requested-With,X-Debug-Mode"
+            CORS_MAX_AGE="3600"
+            CORS_ADDITIONAL_ORIGINS="http://localhost:3000,http://localhost:8080,http://127.0.0.1:3000,http://127.0.0.1:8080"
+          fi
+          
+          # Set CORS environment variables
+          railway variables set "CORS_ORIGINS_${ENVIRONMENT^^}"="$CORS_ORIGINS" || {
+            echo "❌ Failed to set CORS_ORIGINS_${ENVIRONMENT^^} variable"
+            exit 1
+          }
+          
+          if [[ -n "$CORS_ADDITIONAL_ORIGINS" ]]; then
+            railway variables set "CORS_ADDITIONAL_ORIGINS_${ENVIRONMENT^^}"="$CORS_ADDITIONAL_ORIGINS" || {
+              echo "❌ Failed to set CORS_ADDITIONAL_ORIGINS_${ENVIRONMENT^^} variable"
+              exit 1
+            }
+          fi
+          
+          railway variables set CORS_ALLOW_CREDENTIALS="true" || {
+            echo "❌ Failed to set CORS_ALLOW_CREDENTIALS variable"
+            exit 1
+          }
+          
+          railway variables set CORS_ALLOWED_METHODS="$CORS_METHODS" || {
+            echo "❌ Failed to set CORS_ALLOWED_METHODS variable"
+            exit 1
+          }
+          
+          railway variables set CORS_ALLOWED_HEADERS="$CORS_HEADERS" || {
+            echo "❌ Failed to set CORS_ALLOWED_HEADERS variable"
+            exit 1
+          }
+          
+          railway variables set CORS_MAX_AGE="$CORS_MAX_AGE" || {
+            echo "❌ Failed to set CORS_MAX_AGE variable"
+            exit 1
+          }
+          
+          # Deploy backend service from source
+          echo "Deploying backend from source..."
+          railway up --service "$SERVICE_NAME" --detach ./backend || {
+            echo "❌ Backend service deployment failed"
+            exit 1
+          }
+          
+          # Wait for deployment to complete
+          echo "Waiting for backend deployment to complete..."
+          sleep 60
+          
+          # Verify backend deployment
+          BACKEND_URL=$(railway domain | head -n1 2>/dev/null || echo "")
+          if [[ -n "$BACKEND_URL" ]]; then
+            echo "✅ Backend service deployed successfully"
+            echo "Backend URL: https://$BACKEND_URL"
+            echo "backend-url=https://$BACKEND_URL" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Backend URL not yet available, deployment may still be in progress"
+          fi
+          
+          echo "✅ Backend service deployment completed"
+      
+      - name: Deploy Frontend Service
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          echo "🌐 Deploying frontend service..."
+          
+          ENVIRONMENT="${{ steps.railway-config.outputs.environment }}"
+          SERVICE_NAME="anime-frontend-${ENVIRONMENT}"
+          COMMIT_SHA="${{ github.sha }}"
+          
+          # Check if frontend service exists
+          if railway service list | grep -q "$SERVICE_NAME"; then
+            echo "Frontend service '$SERVICE_NAME' already exists"
+            railway service use "$SERVICE_NAME"
+          else
+            echo "Creating new frontend service: $SERVICE_NAME"
+            railway service create "$SERVICE_NAME" || {
+              echo "❌ Failed to create frontend service"
+              exit 1
+            }
+            railway service use "$SERVICE_NAME"
+          fi
+          
+          # Configure frontend service environment variables
+          echo "Configuring frontend service environment variables..."
+          
+          railway variables set ENVIRONMENT="$ENVIRONMENT" || {
+            echo "❌ Failed to set ENVIRONMENT variable"
+            exit 1
+          }
+          
+          railway variables set COMMIT_SHA="$COMMIT_SHA" || {
+            echo "❌ Failed to set COMMIT_SHA variable"
+            exit 1
+          }
+          
+          # Set backend URL for frontend-backend communication
+          if [[ "$ENVIRONMENT" == "production" ]]; then
+            BACKEND_URL="https://anime-backend-production.railway.app"
+          else
+            BACKEND_URL="https://anime-backend-staging.railway.app"
+          fi
+          
+          railway variables set BACKEND_URL="$BACKEND_URL" || {
+            echo "❌ Failed to set BACKEND_URL variable"
+            exit 1
+          }
+          
+          # Deploy frontend service from source
+          echo "Deploying frontend from source..."
+          railway up --service "$SERVICE_NAME" --detach ./frontend || {
+            echo "❌ Frontend service deployment failed"
+            exit 1
+          }
+          
+          # Wait for deployment to complete
+          echo "Waiting for frontend deployment to complete..."
+          sleep 60
+          
+          # Verify frontend deployment
+          FRONTEND_URL=$(railway domain | head -n1 2>/dev/null || echo "")
+          if [[ -n "$FRONTEND_URL" ]]; then
+            echo "✅ Frontend service deployed successfully"
+            echo "Frontend URL: https://$FRONTEND_URL"
+            echo "frontend-url=https://$FRONTEND_URL" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Frontend URL not yet available, deployment may still be in progress"
+          fi
+          
+          echo "✅ Frontend service deployment completed"
+      
+      - name: Configure Inter-Service Communication
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          echo "🔗 Configuring inter-service communication..."
+          
+          ENVIRONMENT="${{ steps.railway-config.outputs.environment }}"
+          
+          # Update backend service with database connection
+          echo "Configuring backend-database communication..."
+          railway service use "anime-backend-${ENVIRONMENT}"
+          
+          # Railway automatically provides DATABASE_URL for PostgreSQL services
+          # Verify the connection is available
+          DATABASE_URL=$(railway variables get DATABASE_URL 2>/dev/null || echo "")
+          if [[ -n "$DATABASE_URL" ]]; then
+            echo "✅ Database connection configured for backend"
+          else
+            echo "⚠️ DATABASE_URL will be automatically provided by Railway"
+          fi
+          
+          # Update frontend service with correct backend URL
+          echo "Configuring frontend-backend communication..."
+          railway service use "anime-frontend-${ENVIRONMENT}"
+          
+          # Get actual backend URL from Railway
+          railway service use "anime-backend-${ENVIRONMENT}"
+          ACTUAL_BACKEND_URL=$(railway domain | head -n1 2>/dev/null || echo "")
+          
+          if [[ -n "$ACTUAL_BACKEND_URL" ]]; then
+            railway service use "anime-frontend-${ENVIRONMENT}"
+            railway variables set BACKEND_URL="https://$ACTUAL_BACKEND_URL" || {
+              echo "❌ Failed to update frontend BACKEND_URL"
+              exit 1
+            }
+            echo "✅ Frontend configured to communicate with backend: https://$ACTUAL_BACKEND_URL"
+          else
+            echo "⚠️ Backend URL not yet available, using configured default"
+          fi
+          
+          echo "✅ Inter-service communication configured"
+      
+      - name: Update commit status - Deployment completed
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'success',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Railway deployment completed successfully',
+              context: 'railway-deployment/deploy'
+            });
+      
+      - name: Deployment Summary
+        run: |
+          echo "🎉 Deployment Summary"
+          echo "===================="
+          echo "Environment: ${{ steps.railway-config.outputs.environment }}"
+          echo "Commit SHA: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo ""
+          echo "Services Deployed:"
+          echo "- Database: anime-database-${{ steps.railway-config.outputs.environment }}"
+          echo "- Backend: anime-backend-${{ steps.railway-config.outputs.environment }}"
+          echo "- Frontend: anime-frontend-${{ steps.railway-config.outputs.environment }}"
+          echo ""
+          echo "✅ All services deployed successfully to Railway"
+      
+      - name: Handle deployment failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'failure',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Railway deployment failed',
+              context: 'railway-deployment/deploy'
+            });
+
+  post-deployment:
+    name: Post-Deployment Verification and Health Checks
+    runs-on: ubuntu-latest
+    needs: [build-and-test, deploy-to-railway]
+    if: always()
+    outputs:
+      health-check-status: ${{ steps.health-summary.outputs.status }}
+      frontend-url: ${{ steps.get-service-urls.outputs.frontend-url }}
+      backend-url: ${{ steps.get-service-urls.outputs.backend-url }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python for health checks
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install health check dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests psycopg2-binary
+      
+      - name: Update commit status - Health checks starting
+        if: needs.deploy-to-railway.result == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'pending',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Running post-deployment health checks...',
+              context: 'railway-deployment/health-checks'
+            });
+      
+      - name: Install Railway CLI
+        if: needs.deploy-to-railway.result == 'success'
+        run: |
+          echo "Installing Railway CLI for service URL retrieval..."
+          curl -fsSL https://railway.app/install.sh | sh
+          echo "$HOME/.railway/bin" >> $GITHUB_PATH
+      
+      - name: Get service URLs from Railway
+        if: needs.deploy-to-railway.result == 'success'
+        id: get-service-urls
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          echo "🔍 Retrieving service URLs from Railway..."
+          
+          ENVIRONMENT="${{ needs.build-and-test.outputs.environment }}"
+          
+          # Authenticate with Railway
+          railway login --token "$RAILWAY_TOKEN"
+          
+          # Set project based on environment
+          if [[ "$ENVIRONMENT" == "production" ]]; then
+            project_id="${{ secrets.RAILWAY_PROJECT_ID_PROD }}"
+          else
+            project_id="${{ secrets.RAILWAY_PROJECT_ID_STAGING }}"
+          fi
+          
+          railway link "$project_id"
+          
+          # Get backend URL
+          echo "Getting backend service URL..."
+          railway service use "anime-backend-${ENVIRONMENT}"
+          BACKEND_URL=$(railway domain | head -n1 2>/dev/null || echo "")
+          
+          if [[ -n "$BACKEND_URL" ]]; then
+            BACKEND_URL="https://$BACKEND_URL"
+            echo "Backend URL: $BACKEND_URL"
+            echo "backend-url=$BACKEND_URL" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Backend URL not available"
+            echo "backend-url=" >> $GITHUB_OUTPUT
+          fi
+          
+          # Get frontend URL
+          echo "Getting frontend service URL..."
+          railway service use "anime-frontend-${ENVIRONMENT}"
+          FRONTEND_URL=$(railway domain | head -n1 2>/dev/null || echo "")
+          
+          if [[ -n "$FRONTEND_URL" ]]; then
+            FRONTEND_URL="https://$FRONTEND_URL"
+            echo "Frontend URL: $FRONTEND_URL"
+            echo "frontend-url=$FRONTEND_URL" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Frontend URL not available"
+            echo "frontend-url=" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Wait for services to be ready
+        if: needs.deploy-to-railway.result == 'success'
+        run: |
+          echo "⏳ Waiting for services to be fully ready..."
+          echo "Allowing additional time for Railway services to start up completely..."
+          sleep 120  # Wait 2 minutes for services to be fully ready
+      
+      - name: Run comprehensive health checks
+        if: needs.deploy-to-railway.result == 'success'
+        id: health-checks
+        continue-on-error: true
+        run: |
+          echo "🏥 Running comprehensive health checks..."
+          
+          FRONTEND_URL="${{ steps.get-service-urls.outputs.frontend-url }}"
+          BACKEND_URL="${{ steps.get-service-urls.outputs.backend-url }}"
+          
+          if [[ -z "$FRONTEND_URL" || -z "$BACKEND_URL" ]]; then
+            echo "❌ Service URLs not available, skipping health checks"
+            echo "health-check-result=failed" >> $GITHUB_OUTPUT
+            echo "health-check-error=Service URLs not available" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          echo "Testing services:"
+          echo "- Frontend: $FRONTEND_URL"
+          echo "- Backend: $BACKEND_URL"
+          
+          # Run comprehensive health check
+          python scripts/health-check.py \
+            --frontend-url "$FRONTEND_URL" \
+            --backend-url "$BACKEND_URL" \
+            --timeout 60 \
+            --retry 3 \
+            --retry-delay 30 \
+            --json > health-check-results.json
+          
+          HEALTH_CHECK_EXIT_CODE=$?
+          
+          # Output results for logging
+          echo "=== Health Check Results ==="
+          cat health-check-results.json | python -m json.tool
+          
+          # Set outputs based on results
+          if [[ $HEALTH_CHECK_EXIT_CODE -eq 0 ]]; then
+            echo "health-check-result=success" >> $GITHUB_OUTPUT
+            echo "✅ All health checks passed!"
+          else
+            echo "health-check-result=failed" >> $GITHUB_OUTPUT
+            echo "❌ Health checks failed!"
+            
+            # Extract error information
+            ERROR_MSG=$(python -c "
+          import json
+          try:
+              with open('health-check-results.json', 'r') as f:
+                  data = json.load(f)
+              issues = data.get('summary', {}).get('issues', [])
+              print('; '.join(issues[:3]) if issues else 'Health checks failed')
+          except:
+              print('Health check execution failed')
+          " 2>/dev/null || echo "Health check execution failed")
+            
+            echo "health-check-error=$ERROR_MSG" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Run individual service health checks
+        if: needs.deploy-to-railway.result == 'success'
+        continue-on-error: true
+        run: |
+          echo "🔍 Running individual service health checks for detailed diagnostics..."
+          
+          FRONTEND_URL="${{ steps.get-service-urls.outputs.frontend-url }}"
+          BACKEND_URL="${{ steps.get-service-urls.outputs.backend-url }}"
+          
+          # Frontend health check
+          if [[ -n "$FRONTEND_URL" ]]; then
+            echo "=== Frontend Health Check ==="
+            python scripts/verify-frontend.py \
+              --frontend-url "$FRONTEND_URL" \
+              --backend-url "$BACKEND_URL" \
+              --timeout 30 \
+              --json > frontend-health.json || true
+            
+            echo "Frontend health check results:"
+            cat frontend-health.json | python -m json.tool || echo "Frontend health check failed to produce JSON output"
+          fi
+          
+          # Backend health check
+          if [[ -n "$BACKEND_URL" ]]; then
+            echo "=== Backend Health Check ==="
+            python scripts/verify-backend.py \
+              --backend-url "$BACKEND_URL" \
+              --timeout 30 \
+              --json > backend-health.json || true
+            
+            echo "Backend health check results:"
+            cat backend-health.json | python -m json.tool || echo "Backend health check failed to produce JSON output"
+          fi
+      
+      - name: Generate deployment report
+        if: always()
+        id: deployment-report
+        run: |
+          echo "📋 Generating deployment report..."
+          
+          # Create deployment report
+          cat > deployment-report.md << 'EOF'
+          # 🚀 Railway Deployment Report
+          
+          ## Deployment Information
+          - **Environment**: ${{ needs.build-and-test.outputs.environment }}
+          - **Commit SHA**: ${{ github.sha }}
+          - **Branch**: ${{ github.ref_name }}
+          - **Deployment Time**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          - **Workflow Run**: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          
+          ## Deployment Status
+          - **Build & Test**: ${{ needs.build-and-test.result == 'success' && '✅ Success' || '❌ Failed' }}
+          - **Railway Deployment**: ${{ needs.deploy-to-railway.result == 'success' && '✅ Success' || '❌ Failed' }}
+          - **Health Checks**: ${{ steps.health-checks.outputs.health-check-result == 'success' && '✅ Passed' || '❌ Failed' }}
+          
+          ## Services Deployed
+          - **Database**: anime-database-${{ needs.build-and-test.outputs.environment }}
+          - **Backend**: anime-backend-${{ needs.build-and-test.outputs.environment }}
+          - **Frontend**: anime-frontend-${{ needs.build-and-test.outputs.environment }}
+          
+          ## Service URLs
+          EOF
+          
+          # Add service URLs if available
+          if [[ -n "${{ steps.get-service-urls.outputs.frontend-url }}" ]]; then
+            echo "- **Frontend**: [${{ steps.get-service-urls.outputs.frontend-url }}](${{ steps.get-service-urls.outputs.frontend-url }})" >> deployment-report.md
+          else
+            echo "- **Frontend**: URL not available" >> deployment-report.md
+          fi
+          
+          if [[ -n "${{ steps.get-service-urls.outputs.backend-url }}" ]]; then
+            echo "- **Backend**: [${{ steps.get-service-urls.outputs.backend-url }}](${{ steps.get-service-urls.outputs.backend-url }})" >> deployment-report.md
+          else
+            echo "- **Backend**: URL not available" >> deployment-report.md
+          fi
+          
+          # Add health check details if available
+          if [[ "${{ needs.deploy-to-railway.result }}" == "success" ]]; then
+            cat >> deployment-report.md << 'EOF'
+          
+          ## Health Check Details
+          EOF
+            
+            if [[ "${{ steps.health-checks.outputs.health-check-result }}" == "success" ]]; then
+              echo "✅ All services are healthy and responding correctly." >> deployment-report.md
+            else
+              echo "❌ Health check issues detected:" >> deployment-report.md
+              echo "- ${{ steps.health-checks.outputs.health-check-error }}" >> deployment-report.md
+            fi
+          else
+            cat >> deployment-report.md << 'EOF'
+          
+          ## Deployment Issues
+          ❌ Deployment failed. Health checks were not performed.
+          EOF
+          fi
+          
+          # Output the report
+          echo "=== Deployment Report ==="
+          cat deployment-report.md
+          
+          # Set report content as output (truncated for GitHub)
+          REPORT_SUMMARY=$(head -n 20 deployment-report.md | tr '\n' ' ')
+          echo "report-summary=$REPORT_SUMMARY" >> $GITHUB_OUTPUT
+      
+      - name: Update commit status - Final result
+        if: always()
+        id: health-summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deploymentSuccess = '${{ needs.deploy-to-railway.result }}' === 'success';
+            const healthCheckSuccess = '${{ steps.health-checks.outputs.health-check-result }}' === 'success';
+            
+            let state, description, context;
+            
+            if (!deploymentSuccess) {
+              state = 'failure';
+              description = 'Deployment to Railway failed';
+              context = 'railway-deployment/deploy';
+            } else if (!healthCheckSuccess) {
+              state = 'failure';
+              description = 'Deployment succeeded but health checks failed';
+              context = 'railway-deployment/health-checks';
+            } else {
+              state = 'success';
+              description = 'Deployment and health checks successful';
+              context = 'railway-deployment/complete';
+            }
+            
+            // Update commit status
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: state,
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: description,
+              context: context
+            });
+            
+            // Set output for other jobs
+            core.setOutput('status', state === 'success' ? 'success' : 'failed');
+            
+            // Log final status
+            if (state === 'success') {
+              core.info('✅ Deployment completed successfully with all health checks passing');
+            } else {
+              core.error(`❌ Deployment status: ${description}`);
+            }
+      
+      - name: Upload health check artifacts
+        if: always() && needs.deploy-to-railway.result == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-check-results-${{ needs.build-and-test.outputs.environment }}
+          path: |
+            health-check-results.json
+            frontend-health.json
+            backend-health.json
+            deployment-report.md
+          retention-days: 30
+      
+      - name: Comment on PR with deployment status
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deploymentSuccess = '${{ needs.deploy-to-railway.result }}' === 'success';
+            const healthCheckSuccess = '${{ steps.health-checks.outputs.health-check-result }}' === 'success';
+            const environment = '${{ needs.build-and-test.outputs.environment }}';
+            const frontendUrl = '${{ steps.get-service-urls.outputs.frontend-url }}';
+            const backendUrl = '${{ steps.get-service-urls.outputs.backend-url }}';
+            
+            let status = '❌ Failed';
+            let details = 'Deployment failed';
+            
+            if (deploymentSuccess && healthCheckSuccess) {
+              status = '✅ Success';
+              details = 'Deployment completed successfully with all health checks passing';
+            } else if (deploymentSuccess) {
+              status = '⚠️ Partial Success';
+              details = 'Deployment succeeded but health checks failed';
+            }
+            
+            let comment = `## 🚀 Railway Deployment Status: ${status}
+            
+            **Environment:** ${environment}
+            **Commit:** ${context.sha.substring(0, 7)}
+            **Status:** ${details}
+            
+            ### Services
+            `;
+            
+            if (frontendUrl) {
+              comment += `- **Frontend:** [${frontendUrl}](${frontendUrl})\n`;
+            }
+            if (backendUrl) {
+              comment += `- **Backend:** [${backendUrl}](${backendUrl})\n`;
+            }
+            
+            comment += `
+            ### Details
+            - Build & Test: ${{ needs.build-and-test.result == 'success' && '✅' || '❌' }}
+            - Railway Deploy: ${{ needs.deploy-to-railway.result == 'success' && '✅' || '❌' }}
+            - Health Checks: ${{ steps.health-checks.outputs.health-check-result == 'success' && '✅' || '❌' }}
+            
+            [View full deployment log](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+            `;
+            
+            // Find existing deployment comment and update it, or create new one
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const existingComment = comments.find(comment => 
+              comment.body.includes('🚀 Railway Deployment Status')
+            );
+            
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: comment
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+            }
+      
+      - name: Final deployment summary
+        if: always()
+        run: |
+          echo "🎯 Final Deployment Summary"
+          echo "=========================="
+          echo "Environment: ${{ needs.build-and-test.outputs.environment }}"
+          echo "Commit SHA: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo ""
+          echo "Results:"
+          echo "- Build & Test: ${{ needs.build-and-test.result }}"
+          echo "- Railway Deployment: ${{ needs.deploy-to-railway.result }}"
+          echo "- Health Checks: ${{ steps.health-checks.outputs.health-check-result || 'skipped' }}"
+          echo ""
+          
+          if [[ "${{ steps.health-summary.outputs.status }}" == "success" ]]; then
+            echo "🎉 Overall Status: SUCCESS"
+            echo "✅ All systems operational!"
+            
+            if [[ -n "${{ steps.get-service-urls.outputs.frontend-url }}" ]]; then
+              echo "🌐 Frontend: ${{ steps.get-service-urls.outputs.frontend-url }}"
+            fi
+            if [[ -n "${{ steps.get-service-urls.outputs.backend-url }}" ]]; then
+              echo "🔧 Backend: ${{ steps.get-service-urls.outputs.backend-url }}"
+            fi
+          else
+            echo "❌ Overall Status: FAILED"
+            echo "Please check the logs above for detailed error information."
+          fi
