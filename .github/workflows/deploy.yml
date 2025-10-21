@@ -91,13 +91,23 @@ jobs:
           echo "✓ Frontend image: $(docker images frontend:${{ github.sha }} --format 'table {{.Repository}}:{{.Tag}}\t{{.Size}}')"
           echo "✓ Backend image: $(docker images backend:${{ github.sha }} --format 'table {{.Repository}}:{{.Tag}}\t{{.Size}}')"
           
-          # Very quick nginx config test (should be instant)
+          # Test nginx config with proper exit handling
           echo "Testing nginx config..."
-          timeout 10 docker run --rm frontend:${{ github.sha }} nginx -t
+          if docker run --rm frontend:${{ github.sha }} sh -c "nginx -t && echo 'nginx config OK'"; then
+            echo "✅ Frontend nginx config is valid"
+          else
+            echo "❌ Frontend nginx config failed"
+            exit 1
+          fi
           
-          # Very quick python import test (should be instant)  
+          # Test python imports with proper exit handling
           echo "Testing python imports..."
-          timeout 10 docker run --rm --entrypoint="" backend:${{ github.sha }} python -c "print('✓ Python OK')"
+          if docker run --rm --entrypoint="" backend:${{ github.sha }} python -c "import fastapi, uvicorn; print('✅ Python imports OK')"; then
+            echo "✅ Backend python imports successful"
+          else
+            echo "❌ Backend python imports failed"
+            exit 1
+          fi
           
           echo "✅ Docker image validation completed successfully"
       
